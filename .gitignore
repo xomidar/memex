@@ -1,0 +1,11 @@
+node_modules/
+.env
+.idea/
+
+# Data directory — keep in a separate private repo
+# See README for data backup instructions
+data/kb/
+data/backup.json
+data/snapshots/
+data/cost.db
+data/cost-ledger.json

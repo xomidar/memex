@@ -1,0 +1,22 @@
+{
+  "name": "memex",
+  "version": "1.0.0",
+  "description": "Personal knowledge engine — semantic memory for AI agents via MCP, powered by LanceDB + OpenAI embeddings",
+  "type": "module",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "seed": "node --env-file=.env scripts/seed.js",
+    "export": "node --env-file=.env scripts/export.js",
+    "snapshot": "node --env-file=.env scripts/snapshot.js create",
+    "snapshot:list": "node --env-file=.env scripts/snapshot.js list",
+    "snapshot:restore": "node --env-file=.env scripts/snapshot.js restore",
+    "cost": "node --env-file=.env scripts/cost.js"
+  },
+  "dependencies": {
+    "@lancedb/lancedb": "^0.27.1",
+    "@modelcontextprotocol/sdk": "latest",
+    "apache-arrow": "^18.0.0",
+    "openai": "^4.24.1"
+  }
+}

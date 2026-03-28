@@ -1,0 +1,6 @@
+# Lance binary files — tell git they're binary (no diff, no merge)
+data/kb/**/*.lance binary
+data/kb/**/*.manifest binary
+data/kb/**/*.idx binary
+# But backup.json is text and should be diffed normally
+data/backup.json text

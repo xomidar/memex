@@ -4,8 +4,10 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
+  ListPromptsRequestSchema,
+  GetPromptRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
-import { tools } from './tools.js';
+import { tools, prompts } from './tools.js';
 import { initDB } from './db.js';
 
 // Validate required env var at startup
@@ -16,16 +18,33 @@ if (!process.env.OPENAI_API_KEY) {
 
 const server = new Server(
   { name: 'memex', version: '1.0.0' },
-  { capabilities: { tools: {} } }
+  { capabilities: { tools: {}, prompts: {} } }
 );
 
-// Build a lookup map for handlers
+// Build lookup maps for handlers
 const toolHandlers = new Map(tools.map(t => [t.name, t.handler]));
 const toolDefinitions = tools.map(t => t.definition);
+const promptHandlers = new Map(prompts.map(p => [p.name, p.handler]));
+const promptDefinitions = prompts.map(p => p.definition);
 
 // List tools
 server.setRequestHandler(ListToolsRequestSchema, async () => {
   return { tools: toolDefinitions };
+});
+
+// List prompts
+server.setRequestHandler(ListPromptsRequestSchema, async () => {
+  return { prompts: promptDefinitions };
+});
+
+// Get prompt
+server.setRequestHandler(GetPromptRequestSchema, async (request) => {
+  const { name, arguments: args } = request.params;
+  const handler = promptHandlers.get(name);
+  if (!handler) {
+    throw new Error(`Unknown prompt: ${name}`);
+  }
+  return handler(args || {});
 });
 
 // Call tool

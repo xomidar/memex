@@ -642,3 +642,100 @@ export const tools = [
     },
   },
 ];
+
+// ---------------------------------------------------------------------------
+// MCP Prompts — server-side guidance for agents
+// ---------------------------------------------------------------------------
+
+export const prompts = [
+  {
+    name: `${p}ingest`,
+    definition: {
+      name: `${p}ingest`,
+      description:
+        `Guides the agent through storing a large document or plan into ${owner}'s knowledge base. The agent provides raw text (from conversation or file), and this prompt returns a structured protocol for proper chunking and storage. Use this when ${owner} says "save this plan", "store this research", or anytime content is too large for a single memorize call.`,
+      arguments: [
+        {
+          name: 'doc_name',
+          description: 'Logical name for the document (e.g. "career-plan", "uni-strategy", "legal-pathway"). Used for recall later.',
+          required: true,
+        },
+        {
+          name: 'category',
+          description: 'Category for all chunks: personal | preference | decision | project | routing | reference. Default: project',
+          required: false,
+        },
+        {
+          name: 'importance',
+          description: 'Importance level "0.0" to "1.0" for all chunks. Default: "0.8"',
+          required: false,
+        },
+      ],
+    },
+    handler({ doc_name, category, importance }) {
+      const cat = category || 'project';
+      const imp = importance || '0.8';
+
+      return {
+        messages: [
+          {
+            role: 'user',
+            content: `You are about to store a document as "${doc_name}" in ${owner}'s knowledge base. Follow this protocol EXACTLY.
+
+## Step 1: Split — Use Bash, NOT the LLM
+
+Do NOT split the text manually. Use a shell command to split deterministically:
+
+If the content is from a file:
+\`\`\`bash
+# Split markdown at ## headings, output as numbered sections
+awk '/^## /{n++} {print > "chunk_"sprintf("%03d",n)".txt"}' /path/to/file.md
+\`\`\`
+
+If the content is from the conversation (paste it to a temp file first):
+\`\`\`bash
+# Write conversation content to temp file, then split
+cat <<'CONTENT' > /tmp/memex_ingest.md
+[PASTE THE FULL TEXT HERE]
+CONTENT
+awk '/^## /{n++} {print > "/tmp/memex_chunk_"sprintf("%03d",n)".txt"}' /tmp/memex_ingest.md
+ls -la /tmp/memex_chunk_*.txt
+\`\`\`
+
+If there are no ## headings, split at logical paragraph boundaries (~500-2000 tokens per chunk) using:
+\`\`\`bash
+split -l 40 /tmp/memex_ingest.md /tmp/memex_chunk_ --additional-suffix=.txt
+\`\`\`
+
+## Step 2: Read each chunk and add metadata
+
+For each chunk file, read it with the Read tool. Then call memorize with:
+
+- **text**: The EXACT raw content from the chunk file. NEVER modify, summarize, or shorten it.
+- **content_type**: "chunk"
+- **doc_name**: "${doc_name}"
+- **chunk_index**: "0" for the first chunk (parent/summary), "1", "2", "3"... for the rest
+- **category**: "${cat}"
+- **importance**: "${imp}"
+- **context**: Write 1-3 sentences describing what THIS specific section contains. Include exact searchable terms — names, numbers, dates, requirements. This is what makes the chunk findable. You have full context from the conversation, use it.
+- **tags**: Relevant comma-separated tags
+
+## Step 3: Write a parent summary (chunk_index "0")
+
+BEFORE storing the section chunks, create chunk_index "0" — a 2-3 sentence summary of the entire document. This is the routing entry that helps recall and ask find the right document.
+
+## Step 4: Verify
+
+After all chunks are stored, call recall("${doc_name}") to verify the document is complete and readable.
+
+## Rules
+- Raw text in, raw text stored. NO summarization. NO paraphrasing. NO truncation.
+- Context field is where YOUR intelligence goes — rich, specific, searchable.
+- The text field is sacred — it's ${owner}'s content, not yours to edit.
+- Clean up temp files after: rm /tmp/memex_chunk_*.txt /tmp/memex_ingest.md`,
+          },
+        ],
+      };
+    },
+  },
+];

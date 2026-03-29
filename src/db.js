@@ -76,6 +76,9 @@ function buildSchema(embeddingFn) {
     chunk_index: new Utf8(),
     // superseded_at: ISO timestamp — set when chunk is replaced by resync; null = active
     superseded_at: new Utf8(),
+    // context: LLM-generated contextual prefix — prepended to text for richer embeddings
+    // (Contextual Retrieval, Anthropic 2024). Stored separately so recall shows clean text.
+    context: new Utf8(),
     // content_hash: 16-char SHA-256 prefix — used for resync change detection
     content_hash: new Utf8(),
   });
@@ -477,11 +480,21 @@ function mapRow(r) {
     );
 
     // Length normalization (Technique 3) — clamp penalty at 1.0 for short entries
-    const lengthPenalty = computeLengthPenalty(r.text ? r.text.length : 0);
+    // Skip length penalty for chunks — they're pre-sized by the chunking strategy
+    // and longer chunks contain MORE useful information, not less.
+    const lengthPenalty = (r.content_type === 'chunk') ? 1.0 : computeLengthPenalty(r.text ? r.text.length : 0);
     const normalizedScore = rawBlended * lengthPenalty;
 
     // Type bonus (Technique 4) — additive, small, breaks ties
     blendedScore = normalizedScore + getTypeBonus(r.category);
+
+    // Parent summary demotion (Technique 13) — when searching, prefer specific sections
+    // over broad parent summaries. Parent summaries (chunk_index=0) are routing entries
+    // for recall, not the best match for precise queries. Small penalty so they yield
+    // to children that have higher cosine similarity on specific terms.
+    if (r.content_type === 'chunk' && r.chunk_index === '0') {
+      blendedScore *= 0.90; // 10% demotion for parent summaries in search
+    }
   }
 
   return {
@@ -502,6 +515,7 @@ function mapRow(r) {
     chunk_index: r.chunk_index != null ? r.chunk_index : null,
     superseded_at: r.superseded_at || null,
     content_hash: r.content_hash || null,
+    context: r.context || null,
     score: cosineSimilarity,
     blendedScore,
     // Keep vector for diversity filter — stripped before returning to callers
@@ -595,7 +609,7 @@ export async function addEntry(
   skipAdmission = false,
 ) {
   // Detect options-object call pattern (used by resyncDocument and chunk memorize handler)
-  let decay_exempt, options_content_type, options_chunk_index, options_content_hash;
+  let decay_exempt, options_content_type, options_chunk_index, options_content_hash, options_context;
   if (decay_exempt_or_options && typeof decay_exempt_or_options === 'object') {
     const opts = decay_exempt_or_options;
     decay_exempt = opts.decay_exempt || 'false';
@@ -604,11 +618,20 @@ export async function addEntry(
     options_content_type = opts.content_type || 'entry';
     options_chunk_index = opts.chunk_index != null ? String(opts.chunk_index) : null;
     options_content_hash = opts.content_hash || null;
+    options_context = opts.context || null;
   } else {
     decay_exempt = decay_exempt_or_options || 'false';
     options_content_type = 'entry';
     options_chunk_index = null;
     options_content_hash = null;
+    options_context = null;
+  }
+
+  // Contextual Retrieval (Anthropic 2024): if context is provided, prepend it to text
+  // for richer embeddings. The original text is preserved via the context column.
+  // Harvey (or any calling LLM) generates the context — zero extra API cost.
+  if (options_context && options_context.trim()) {
+    text = `${options_context.trim()}\n\n${text}`;
   }
   await initDB();
   const now = new Date().toISOString();
@@ -685,6 +708,7 @@ export async function addEntry(
           chunk_index: options_chunk_index,
           superseded_at: null,
           content_hash: options_content_hash,
+          context: options_context,
         };
         await table.add([entry]);
         const result = {
@@ -799,6 +823,7 @@ export async function addEntry(
     chunk_index: options_chunk_index,
     superseded_at: null,
     content_hash: options_content_hash,
+    context: options_context,
   };
   // LanceDB embedding function auto-populates the vector field from text
   await table.add([entry]);
@@ -965,6 +990,7 @@ export async function listByDocTag(docName) {
         chunk_index: r.chunk_index != null ? r.chunk_index : null,
         superseded_at: r.superseded_at || null,
         content_hash: r.content_hash || null,
+    context: r.context || null,
       }));
   } catch (err) {
     throw new Error(`listByDocTag failed: ${err.message}`);
@@ -1139,6 +1165,7 @@ export async function listEntries(category = null, limit = 50) {
       chunk_index: r.chunk_index != null ? r.chunk_index : null,
       superseded_at: r.superseded_at || null,
       content_hash: r.content_hash || null,
+    context: r.context || null,
     }));
   } catch (err) {
     throw new Error(`List failed: ${err.message}`);
@@ -1204,6 +1231,7 @@ export async function importEntries(entries) {
         chunk_index: e.chunk_index != null ? e.chunk_index : null,
         superseded_at: e.superseded_at || null,
         content_hash: e.content_hash || null,
+        context: e.context || null,
       }];
     });
     await table.add(batch);

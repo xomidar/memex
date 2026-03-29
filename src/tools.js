@@ -195,11 +195,16 @@ export const tools = [
             description:
               'Logical document name. Automatically added as doc:<name> tag. Only used with content_type=chunk.',
           },
+          context: {
+            type: 'string',
+            description:
+              'Contextual Retrieval prefix — a 1-3 sentence description of what this entry is about, written by the calling agent who has full document context. Prepended to text for richer embeddings but stored separately so recall shows clean content. Example: "This describes TU Darmstadt\'s ELITE-tier AI & ML master\'s program with IELTS 7.0 requirement and MED-HIGH admission chance."',
+          },
         },
         required: ['text', 'category'],
       },
     },
-    async handler({ text, category, tags, decay_exempt, importance, content_type, chunk_index, doc_name }) {
+    async handler({ text, category, tags, decay_exempt, importance, content_type, chunk_index, doc_name, context }) {
       try {
         let finalText = text;
         let finalTags = tags || '';
@@ -256,6 +261,7 @@ export const tools = [
             content_type: finalContentType,
             chunk_index: finalChunkIndex,
             content_hash: contentHash,
+            context: context || null,
           },
         );
 
@@ -490,7 +496,12 @@ export const tools = [
           const label = c.chunk_index === '0'
             ? `[Summary]`
             : `[Section ${c.chunk_index}]`;
-          return `${label}\n${c.text}`;
+          // Strip context prefix from display — show clean original text
+          let displayText = c.text;
+          if (c.context && displayText.startsWith(c.context.trim())) {
+            displayText = displayText.slice(c.context.trim().length).replace(/^\n+/, '');
+          }
+          return `${label}\n${displayText}`;
         });
 
         const docText = sections.join('\n\n---\n\n');

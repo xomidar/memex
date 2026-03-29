@@ -1,5 +1,7 @@
 # Memex
 
+[![SafeSkill 89/100](https://img.shields.io/badge/SafeSkill-89%2F100_Passes%20with%20Notes-yellow)](https://safeskill.dev/scan/xomidar-memex)
+
 Semantic memory for AI agents. An MCP server that gives your AI assistant a persistent, searchable knowledge base powered by vector embeddings.
 
 Built for [Claude Code](https://docs.anthropic.com/en/docs/claude-code). Works with any MCP-compatible client.

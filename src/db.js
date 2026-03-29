@@ -2,7 +2,7 @@ import * as lancedb from '@lancedb/lancedb';
 import { LanceSchema, getRegistry } from '@lancedb/lancedb/embedding';
 import '@lancedb/lancedb/embedding/openai';  // registers OpenAI in the embedding registry
 import { Utf8 } from 'apache-arrow';
-import { randomUUID } from 'crypto';
+import { randomUUID, createHash } from 'crypto';
 import { config } from './config.js';
 import { evaluateAdmission } from './admission.js';
 import { recordUsage } from './cost-tracker.js';
@@ -70,6 +70,14 @@ function buildSchema(embeddingFn) {
     last_accessed: new Utf8(),
     // tier: "core" | "working" | "peripheral" — auto-assigned from category, controls Weibull β
     tier: new Utf8(),
+    // content_type: "entry" (default) | "chunk" — distinguishes standalone entries from doc sections
+    content_type: new Utf8(),
+    // chunk_index: "0", "1", "2"... for ordering within a document; null for standalone entries
+    chunk_index: new Utf8(),
+    // superseded_at: ISO timestamp — set when chunk is replaced by resync; null = active
+    superseded_at: new Utf8(),
+    // content_hash: 16-char SHA-256 prefix — used for resync change detection
+    content_hash: new Utf8(),
   });
 }
 
@@ -275,6 +283,78 @@ function reorderForLLM(results) {
 }
 
 // ---------------------------------------------------------------------------
+// Chunk helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Extract the doc name from a comma-separated tags string.
+ * Looks for "doc:<name>" tag. Returns null if not found or tags is empty/null.
+ *
+ * @param {string|null|undefined} tags - comma-separated tag string, e.g. "project,doc:career-plan"
+ * @returns {string|null} doc name without "doc:" prefix, or null
+ */
+export function extractDocTag(tags) {
+  if (!tags || typeof tags !== 'string') return null;
+  const parts = tags.split(',');
+  for (const part of parts) {
+    const trimmed = part.trim();
+    if (trimmed.startsWith('doc:')) {
+      const name = trimmed.slice(4).trim();
+      return name.length > 0 ? name : null;
+    }
+  }
+  return null;
+}
+
+/**
+ * Compute a 16-character SHA-256 hash prefix for chunk dedup.
+ * Sufficient for change detection at this scale — collision probability negligible.
+ *
+ * @param {string} text
+ * @returns {string} 16-char hex string
+ */
+export function computeContentHash(text) {
+  return createHash('sha256').update(text).digest('hex').slice(0, 16);
+}
+
+/**
+ * Auto-merge hint: when 3+ chunks from the same doc appear in results,
+ * annotate them with _autoMergeHint so the caller can suggest recall().
+ * This avoids an extra DB round-trip — we flag but don't fetch the parent here.
+ *
+ * @param {Array} results - mapped rows from searchEntries
+ * @returns {Array} same array, with _autoMergeHint added where applicable
+ */
+function autoMergeChunks(results) {
+  // Count active chunks per doc_name among results
+  const docCounts = {};
+  for (const r of results) {
+    const docTag = extractDocTag(r.tags);
+    if (docTag && r.content_type === 'chunk' && !r.superseded_at) {
+      docCounts[docTag] = (docCounts[docTag] || 0) + 1;
+    }
+  }
+
+  // For docs with 3+ chunk hits, annotate all their chunks unless parent already present
+  for (const [docName, count] of Object.entries(docCounts)) {
+    if (count >= 3) {
+      const hasParent = results.some(r =>
+        extractDocTag(r.tags) === docName && r.chunk_index === '0'
+      );
+      if (!hasParent) {
+        for (const r of results) {
+          if (extractDocTag(r.tags) === docName && r.content_type === 'chunk') {
+            r._autoMergeHint = docName;
+          }
+        }
+      }
+    }
+  }
+
+  return results;
+}
+
+// ---------------------------------------------------------------------------
 // Relevance filtering
 // ---------------------------------------------------------------------------
 
@@ -417,6 +497,11 @@ function mapRow(r) {
     access_count: r.access_count || '0',
     last_accessed: r.last_accessed || null,
     tier,
+    // New chunk fields — default gracefully for pre-2.0 rows
+    content_type: r.content_type || 'entry',
+    chunk_index: r.chunk_index != null ? r.chunk_index : null,
+    superseded_at: r.superseded_at || null,
+    content_hash: r.content_hash || null,
     score: cosineSimilarity,
     blendedScore,
     // Keep vector for diversity filter — stripped before returning to callers
@@ -474,7 +559,7 @@ function updateAccessTracking(ids, accessCountMap) {
  * addEntry — Insert a new entry with admission control and deduplication.
  *
  * Admission runs BEFORE dedup (dedup only runs if admitted).
- * Pass skipAdmission=true for bulk import to bypass the gate.
+ * Pass skipAdmission=true (or options.skipAdmission=true) to bypass the gate.
  *
  * Returns:
  *   { ...entry }                                       — normal insert
@@ -487,19 +572,44 @@ function updateAccessTracking(ids, accessCountMap) {
  * @param {string} category
  * @param {string} [source='user_explicit']
  * @param {string} [tags='']
- * @param {string} [decay_exempt='false']
+ * @param {string|boolean|object} [decay_exempt_or_options='false'] - legacy string/bool OR options object
  * @param {string} [importance='0.5']
  * @param {boolean} [skipAdmission=false]
+ *
+ * When called with an options object as 5th argument:
+ * @param {object} options
+ * @param {string}  [options.decay_exempt='false']
+ * @param {string}  [options.importance='0.5']
+ * @param {boolean} [options.skipAdmission=false]
+ * @param {string}  [options.content_type='entry']
+ * @param {string}  [options.chunk_index=null]
+ * @param {string}  [options.content_hash=null]
  */
 export async function addEntry(
   text,
   category,
   source = 'user_explicit',
   tags = '',
-  decay_exempt = 'false',
+  decay_exempt_or_options = 'false',
   importance = '0.5',
   skipAdmission = false,
 ) {
+  // Detect options-object call pattern (used by resyncDocument and chunk memorize handler)
+  let decay_exempt, options_content_type, options_chunk_index, options_content_hash;
+  if (decay_exempt_or_options && typeof decay_exempt_or_options === 'object') {
+    const opts = decay_exempt_or_options;
+    decay_exempt = opts.decay_exempt || 'false';
+    importance = opts.importance || importance || '0.5';
+    skipAdmission = opts.skipAdmission === true;
+    options_content_type = opts.content_type || 'entry';
+    options_chunk_index = opts.chunk_index != null ? String(opts.chunk_index) : null;
+    options_content_hash = opts.content_hash || null;
+  } else {
+    decay_exempt = decay_exempt_or_options || 'false';
+    options_content_type = 'entry';
+    options_chunk_index = null;
+    options_content_hash = null;
+  }
   await initDB();
   const now = new Date().toISOString();
   const tier = assignTier(category, decay_exempt);
@@ -571,6 +681,10 @@ export async function addEntry(
           access_count: '0',
           last_accessed: null,
           tier,
+          content_type: options_content_type,
+          chunk_index: options_chunk_index,
+          superseded_at: null,
+          content_hash: options_content_hash,
         };
         await table.add([entry]);
         const result = {
@@ -638,6 +752,10 @@ export async function addEntry(
             access_count: '0',
             last_accessed: null,
             tier,
+            content_type: options_content_type,
+            chunk_index: options_chunk_index,
+            superseded_at: null,
+            content_hash: options_content_hash,
           };
           await table.add([entry]);
           return {
@@ -677,6 +795,10 @@ export async function addEntry(
     access_count: '0',
     last_accessed: null,
     tier,
+    content_type: options_content_type,
+    chunk_index: options_chunk_index,
+    superseded_at: null,
+    content_hash: options_content_hash,
   };
   // LanceDB embedding function auto-populates the vector field from text
   await table.add([entry]);
@@ -726,6 +848,9 @@ export async function searchEntries(query, limit = 5, categoryFilter = null, app
     // Map rows — computes Weibull decay, length normalization, type bonus
     let results = raw.map(mapRow);
 
+    // Exclude superseded chunks — they've been replaced by a resync
+    results = results.filter(r => !r.superseded_at);
+
     // Sort descending by blended score
     results.sort((a, b) => (b.blendedScore ?? b.score ?? 0) - (a.blendedScore ?? a.score ?? 0));
 
@@ -741,6 +866,12 @@ export async function searchEntries(query, limit = 5, categoryFilter = null, app
     } else {
       // reflect mode — no floor/gap cuts, but still honour the requested limit
       results = results.slice(0, limit);
+    }
+
+    // Auto-merge hint: annotate chunks when 3+ from same doc hit (applyFilters only)
+    // In reflect mode we show everything — no need to hint about recall()
+    if (applyFilters) {
+      results = autoMergeChunks(results);
     }
 
     // Fire-and-forget access tracking update (Technique 1)
@@ -766,6 +897,28 @@ export async function removeEntry(query) {
     }
     const match = results[0];
     assertUUID(match.id);
+
+    // Cascade delete: if this is a document parent chunk, delete all sibling chunks too
+    const matchContentType = match.content_type || 'entry';
+    const matchChunkIndex = match.chunk_index != null ? match.chunk_index : null;
+    if (matchContentType === 'chunk' && matchChunkIndex === '0') {
+      const docTag = extractDocTag(match.tags);
+      if (docTag) {
+        const allChunks = await listByDocTag(docTag);
+        for (const chunk of allChunks) {
+          assertUUID(chunk.id);
+          await table.delete(`id = '${chunk.id}'`);
+        }
+        return {
+          id: match.id,
+          text: match.text,
+          category: match.category,
+          cascadeDeleted: allChunks.length,
+          docName: docTag,
+        };
+      }
+    }
+
     await table.delete(`id = '${match.id}'`);
     return {
       id: match.id,
@@ -775,6 +928,190 @@ export async function removeEntry(query) {
   } catch (err) {
     throw new Error(`Remove failed: ${err.message}`);
   }
+}
+
+/**
+ * List all active (non-superseded) chunks belonging to a document.
+ * Used by removeEntry cascade, resyncDocument, and the recall tool.
+ *
+ * @param {string} docName - logical document name (without "doc:" prefix)
+ * @returns {Promise<Array<object>>} array of mapped row objects
+ */
+export async function listByDocTag(docName) {
+  const { table: t } = await initDB();
+  try {
+    // LanceDB doesn't support LIKE on string columns efficiently — fetch and filter in JS
+    // No hard limit — must scan full table to avoid silently missing chunks
+    const all = await t.query().toArray();
+    return all
+      .filter(r => {
+        const tag = extractDocTag(r.tags);
+        return tag === docName && !(r.superseded_at);
+      })
+      .map(r => ({
+        id: r.id,
+        text: r.text,
+        category: r.category,
+        source: r.source,
+        tags: r.tags,
+        created_at: r.created_at,
+        updated_at: r.updated_at,
+        decay_exempt: r.decay_exempt || 'false',
+        importance: r.importance || '0.5',
+        access_count: r.access_count || '0',
+        last_accessed: r.last_accessed || null,
+        tier: r.tier || assignTier(r.category, r.decay_exempt || 'false'),
+        content_type: r.content_type || 'entry',
+        chunk_index: r.chunk_index != null ? r.chunk_index : null,
+        superseded_at: r.superseded_at || null,
+        content_hash: r.content_hash || null,
+      }));
+  } catch (err) {
+    throw new Error(`listByDocTag failed: ${err.message}`);
+  }
+}
+
+/**
+ * Safely replace all chunks for a document using insert-then-supersede.
+ * New chunks are written first; old ones are marked superseded only after all
+ * inserts succeed. If the embedding API fails mid-batch, old data is preserved.
+ *
+ * Unchanged chunks (same content_hash at same chunk_index) are skipped —
+ * their access patterns and creation timestamps are preserved.
+ *
+ * @param {string} docName - logical document name (without "doc:" prefix)
+ * @param {Array<{
+ *   text: string,
+ *   category?: string,
+ *   tags?: string,
+ *   importance?: string,
+ *   decay_exempt?: string
+ * }>} chunks - ordered array of chunk data; chunks[0] is the parent summary
+ * @param {object} [options={}]
+ * @param {string} [options.source='resync']
+ * @param {string} [options.importance='0.7']
+ * @param {string} [options.decay_exempt='false']
+ * @returns {Promise<{
+ *   success: boolean,
+ *   docName: string,
+ *   total?: number,
+ *   changed?: number,
+ *   unchanged?: number,
+ *   superseded?: number,
+ *   error?: string,
+ *   failed?: number,
+ *   inserted?: number
+ * }>}
+ */
+export async function resyncDocument(docName, chunks, options = {}) {
+  await initDB();
+
+  // Step 1: Get existing active chunks for this doc
+  const existing = await listByDocTag(docName);
+
+  // Step 2: Hash new chunks, compare with existing at same position
+  const newChunks = chunks.map((chunk, i) => {
+    const hash = computeContentHash(chunk.text);
+    const existingMatch = existing.find(
+      e => e.content_hash === hash && e.chunk_index === String(i)
+    );
+    return { ...chunk, hash, unchanged: !!existingMatch, existingId: existingMatch?.id };
+  });
+
+  // Step 3: Insert only CHANGED chunks (skip unchanged to preserve their access history)
+  const inserted = [];
+  for (let i = 0; i < newChunks.length; i++) {
+    const nc = newChunks[i];
+
+    if (nc.unchanged) {
+      inserted.push({ id: nc.existingId, skipped: true });
+      continue;
+    }
+
+    // Ensure doc tag is present in tags
+    const baseTags = nc.tags || '';
+    const docTag = `doc:${docName}`;
+    const tags = baseTags.includes(docTag)
+      ? baseTags
+      : (baseTags ? `${baseTags},${docTag}` : docTag);
+
+    // Parent summary (chunk_index 0) gets higher importance floor
+    const chunkImportance = i === 0
+      ? String(Math.max(parseFloat(nc.importance || options.importance || '0.7'), 0.7))
+      : (nc.importance || options.importance || '0.7');
+
+    let entryText = nc.text;
+    // Prepend context header for non-parent chunks (improves embedding relevance)
+    if (i > 0) {
+      const firstLine = nc.text.split('\n')[0].replace(/^#+\s*/, '').trim();
+      entryText = `[Document: ${docName} | Section: ${firstLine}]\n${nc.text}`;
+    }
+
+    const entry = await addEntry(
+      entryText,
+      nc.category || 'project',
+      options.source || 'resync',
+      tags,
+      {
+        content_type: 'chunk',
+        chunk_index: String(i),
+        importance: chunkImportance,
+        decay_exempt: nc.decay_exempt || options.decay_exempt || 'false',
+        skipAdmission: true,
+        content_hash: nc.hash,
+      },
+    );
+    inserted.push(entry);
+  }
+
+  // Step 4: Normalize inserted results and verify
+  // addEntry can return { duplicate: true, ... }, { near_duplicate: true, new: {...} }, or a normal entry.
+  // Normalize so we always have a usable id for Step 5 comparison.
+  const normalizedInserts = inserted.map(e => {
+    if (!e) return null;
+    if (e.skipped) return e; // unchanged chunk, has .id
+    if (e.duplicate) return { id: e.id, skipped: true }; // exact dup = treat as kept
+    if (e.near_duplicate) return e.new || e; // near-dup: use the newly created entry
+    return e; // normal insert
+  });
+
+  const failedInserts = normalizedInserts.filter(e => !e || (e.rejected && !e.skipped));
+  if (failedInserts.length > 0) {
+    return {
+      success: false,
+      error: 'Some chunks failed to insert',
+      failed: failedInserts.length,
+      inserted: inserted.length - failedInserts.length,
+    };
+  }
+
+  // Step 5: Supersede old chunks that were NOT kept unchanged or matched as duplicates
+  const now = new Date().toISOString();
+  let supersededCount = 0;
+  const keptIds = new Set(normalizedInserts.filter(e => e?.skipped && e?.id).map(e => e.id));
+  for (const old of existing) {
+    const wasKept = keptIds.has(old.id);
+    if (!wasKept) {
+      assertUUID(old.id);
+      await table.update({
+        where: `id = '${old.id}'`,
+        values: { superseded_at: now },
+      });
+      supersededCount++;
+    }
+  }
+
+  const unchangedCount = newChunks.filter(nc => nc.unchanged).length;
+  const changedCount = newChunks.length - unchangedCount;
+
+  return {
+    success: true,
+    docName,
+    total: newChunks.length,
+    changed: changedCount,
+    unchanged: unchangedCount,
+    superseded: supersededCount,
+  };
 }
 
 export async function listEntries(category = null, limit = 50) {
@@ -798,6 +1135,10 @@ export async function listEntries(category = null, limit = 50) {
       access_count: r.access_count || '0',
       last_accessed: r.last_accessed || null,
       tier: r.tier || assignTier(r.category, r.decay_exempt),
+      content_type: r.content_type || 'entry',
+      chunk_index: r.chunk_index != null ? r.chunk_index : null,
+      superseded_at: r.superseded_at || null,
+      content_hash: r.content_hash || null,
     }));
   } catch (err) {
     throw new Error(`List failed: ${err.message}`);
@@ -858,6 +1199,11 @@ export async function importEntries(entries) {
         access_count: e.access_count || '0',
         last_accessed: e.last_accessed || null,
         tier: e.tier || assignTier(category, decayExempt),
+        // New chunk fields — default gracefully for pre-2.0 backups
+        content_type: e.content_type || 'entry',
+        chunk_index: e.chunk_index != null ? e.chunk_index : null,
+        superseded_at: e.superseded_at || null,
+        content_hash: e.content_hash || null,
       }];
     });
     await table.add(batch);

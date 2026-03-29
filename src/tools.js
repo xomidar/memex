@@ -1,4 +1,5 @@
-import { searchEntries, addEntry, removeEntry, listEntries } from './db.js';
+import { searchEntries, addEntry, removeEntry, listByDocTag, extractDocTag, computeContentHash } from './db.js';
+import { addTodo, listTodos, completeTodo, removeTodo, getTodoStats } from './rdms.js';
 import { config } from './config.js';
 
 const prefix = config.toolPrefix;
@@ -7,6 +8,9 @@ const owner = config.ownerName;
 
 /**
  * Format a date string as YYYY-MM-DD for display.
+ *
+ * @param {string|null} isoString
+ * @returns {string}
  */
 function formatDate(isoString) {
   if (!isoString) return 'unknown';
@@ -54,6 +58,9 @@ function truncateAtSentenceBoundary(text, maxChars) {
  * Format:
  *   [Memory #1 — Score: 0.91 — Category: preference — Stored: 2026-02-14]
  *   Reza prefers responses under 400 words...
+ *
+ * @param {Array} results
+ * @returns {string}
  */
 function formatResultsForLLM(results) {
   // Adaptive truncation limit based on result count (Technique 5)
@@ -81,12 +88,15 @@ function formatResultsForLLM(results) {
 }
 
 export const tools = [
+  // ---------------------------------------------------------------------------
+  // ask — semantic search
+  // ---------------------------------------------------------------------------
   {
     name: `${p}ask`,
     definition: {
       name: `${p}ask`,
       description:
-        `Search ${owner}'s knowledge base for relevant context. Use this when you need information about ${owner}'s preferences, past decisions, personal details, project context, or routing precedents.`,
+        `Search and find information in ${owner}'s knowledge base. Use this when you need to look up ${owner}'s preferences, past decisions, personal details, project context, or routing precedents. For retrieving a complete document or plan use recall instead.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -116,19 +126,33 @@ export const tools = [
         if (results.length === 0) {
           return { content: [{ type: 'text', text: 'No matching entries found.' }] };
         }
-        return { content: [{ type: 'text', text: formatResultsForLLM(results) }] };
+
+        // Build the main response text
+        let text = formatResultsForLLM(results);
+
+        // Auto-merge hint: if any result carries _autoMergeHint, append recall suggestion
+        const hintedDocs = [...new Set(results.filter(r => r._autoMergeHint).map(r => r._autoMergeHint))];
+        if (hintedDocs.length > 0) {
+          const hints = hintedDocs.map(d => `recall('${d}')`).join(', ');
+          text += `\n\n[Note: Multiple sections from document${hintedDocs.length > 1 ? 's' : ''} ${hintedDocs.map(d => `'${d}'`).join(', ')} matched. Use ${hints} to see the full document${hintedDocs.length > 1 ? 's' : ''}.]`;
+        }
+
+        return { content: [{ type: 'text', text }] };
       } catch (err) {
         return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
       }
     },
   },
 
+  // ---------------------------------------------------------------------------
+  // memorize — store knowledge
+  // ---------------------------------------------------------------------------
   {
     name: `${p}memorize`,
     definition: {
       name: `${p}memorize`,
       description:
-        `Store information in ${owner}'s knowledge base. Use this when ${owner} asks you to remember something, or when you learn something important about ${owner}'s preferences, decisions, or context.`,
+        `Store knowledge in ${owner}'s knowledge base. Use this when ${owner} asks you to remember something, or when you learn something important about ${owner}'s preferences, decisions, or context.`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -155,20 +179,84 @@ export const tools = [
             description:
               'Importance level from "0.0" to "1.0". Higher importance extends the effective memory half-life via Weibull decay modulation. Defaults to "0.5".',
           },
+          content_type: {
+            type: 'string',
+            enum: ['entry', 'chunk'],
+            description:
+              '"entry" for standalone knowledge (default). "chunk" for document sections stored via ingest workflow.',
+          },
+          chunk_index: {
+            type: 'string',
+            description:
+              'Position within document ("0" = parent summary, "1"+ = sections). Only used with content_type=chunk.',
+          },
+          doc_name: {
+            type: 'string',
+            description:
+              'Logical document name. Automatically added as doc:<name> tag. Only used with content_type=chunk.',
+          },
         },
         required: ['text', 'category'],
       },
     },
-    async handler({ text, category, tags, decay_exempt, importance }) {
+    async handler({ text, category, tags, decay_exempt, importance, content_type, chunk_index, doc_name }) {
       try {
+        let finalText = text;
+        let finalTags = tags || '';
+        let skipAdmission = false;
+        let finalImportance = importance || '0.5';
+        let finalContentType = content_type || 'entry';
+        let finalChunkIndex = chunk_index != null ? String(chunk_index) : null;
+        let contentHash = null;
+
+        // Chunk handling
+        if (content_type === 'chunk') {
+          // doc_name is required for chunks — without it, recall can never find them
+          if (!doc_name) {
+            return {
+              content: [{ type: 'text', text: 'doc_name is required when content_type is "chunk". Without it, the chunk becomes unretrievable.' }],
+              isError: true,
+            };
+          }
+
+          skipAdmission = true;
+
+          // Ensure doc tag in tags
+          if (doc_name) {
+            const docTag = `doc:${doc_name}`;
+            finalTags = finalTags.includes(docTag)
+              ? finalTags
+              : (finalTags ? `${finalTags},${docTag}` : docTag);
+          }
+
+          // Parent summary gets importance floor of 0.7
+          if (chunk_index === '0') {
+            finalImportance = String(Math.max(parseFloat(importance || '0.5'), 0.7));
+          }
+
+          // Prepend context header for non-parent chunks
+          if (chunk_index !== '0' && doc_name) {
+            const firstLine = text.split('\n')[0].replace(/^#+\s*/, '').trim();
+            finalText = `[Document: ${doc_name} | Section: ${firstLine}]\n${text}`;
+          }
+
+          // Compute hash on the ORIGINAL text (before header injection)
+          contentHash = computeContentHash(text);
+        }
+
         const result = await addEntry(
-          text,
+          finalText,
           category,
           'user_explicit',
-          tags || '',
-          decay_exempt || 'false',
-          importance || '0.5',
-          false, // skipAdmission = false for explicit user storage
+          finalTags,
+          {
+            decay_exempt: decay_exempt || 'false',
+            importance: finalImportance,
+            skipAdmission,
+            content_type: finalContentType,
+            chunk_index: finalChunkIndex,
+            content_hash: contentHash,
+          },
         );
 
         // Admission rejected — explain why and don't store
@@ -216,11 +304,15 @@ export const tools = [
           };
         }
 
+        const chunkSuffix = result.content_type === 'chunk'
+          ? `\nContent type: chunk\nChunk index: ${result.chunk_index}\nDoc: ${extractDocTag(result.tags) || 'n/a'}`
+          : '';
+
         return {
           content: [
             {
               type: 'text',
-              text: `Stored. ID: ${result.id}\nCategory: ${result.category}\nTier: ${result.tier}\nDecay exempt: ${result.decay_exempt}\nImportance: ${result.importance}\nText: ${result.text}`,
+              text: `Stored. ID: ${result.id}\nCategory: ${result.category}\nTier: ${result.tier}\nDecay exempt: ${result.decay_exempt}\nImportance: ${result.importance}${chunkSuffix}\nText: ${result.text}`,
             },
           ],
         };
@@ -230,12 +322,15 @@ export const tools = [
     },
   },
 
+  // ---------------------------------------------------------------------------
+  // forget — remove entries (cascade for document parents)
+  // ---------------------------------------------------------------------------
   {
     name: `${p}forget`,
     definition: {
       name: `${p}forget`,
       description:
-        `Remove an entry from ${owner}'s knowledge base. Finds the closest semantic match to the query and removes it.`,
+        `Remove an entry from ${owner}'s knowledge base. Finds the closest semantic match to the query and removes it. If the match is a document parent chunk, all sections of that document are also removed (cascade delete).`,
       inputSchema: {
         type: 'object',
         properties: {
@@ -253,6 +348,18 @@ export const tools = [
         if (!removed) {
           return { content: [{ type: 'text', text: 'No close match found. Nothing removed.' }] };
         }
+
+        if (removed.cascadeDeleted != null) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `Removed document "${removed.docName}" and all its sections.\nCascade deleted: ${removed.cascadeDeleted} chunk(s)\nParent ID: ${removed.id}\nCategory: ${removed.category}\nText: ${removed.text}`,
+              },
+            ],
+          };
+        }
+
         return {
           content: [
             {
@@ -267,6 +374,9 @@ export const tools = [
     },
   },
 
+  // ---------------------------------------------------------------------------
+  // reflect — audit what's stored
+  // ---------------------------------------------------------------------------
   {
     name: `${p}reflect`,
     definition: {
@@ -311,6 +421,210 @@ export const tools = [
             },
           ],
         };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+      }
+    },
+  },
+
+  // ---------------------------------------------------------------------------
+  // recall — retrieve full document by name
+  // ---------------------------------------------------------------------------
+  {
+    name: `${p}recall`,
+    definition: {
+      name: `${p}recall`,
+      description:
+        `Retrieve a full document from ${owner}'s knowledge base by name. Use this when ${owner} asks to see a complete plan, strategy, or research document — not for searching specific facts (use ask for that). Returns all sections in reading order.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          name: {
+            type: 'string',
+            description:
+              'Document name (e.g. "career-plan", "driving-license", "ecosystem-research"). Matches the doc:<name> tag used when the document was stored.',
+          },
+        },
+        required: ['name'],
+      },
+    },
+    async handler({ name }) {
+      try {
+        // Validate name — no injection vectors
+        if (!name || typeof name !== 'string' || name.trim().length === 0) {
+          return { content: [{ type: 'text', text: 'Document name is required.' }], isError: true };
+        }
+        const safeName = name.trim();
+
+        const chunks = await listByDocTag(safeName);
+        if (chunks.length === 0) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `No document found with name "${safeName}". Use memorize with content_type=chunk and doc_name="${safeName}" to store one.`,
+              },
+            ],
+          };
+        }
+
+        // Filter superseded (listByDocTag already does this, but be defensive)
+        const active = chunks.filter(c => !c.superseded_at);
+        if (active.length === 0) {
+          return {
+            content: [
+              { type: 'text', text: `Document "${safeName}" exists but all chunks are superseded.` },
+            ],
+          };
+        }
+
+        // Sort by chunk_index numerically, nulls last
+        active.sort((a, b) => {
+          const ai = a.chunk_index != null ? parseInt(a.chunk_index, 10) : Infinity;
+          const bi = b.chunk_index != null ? parseInt(b.chunk_index, 10) : Infinity;
+          return ai - bi;
+        });
+
+        // Concatenate with section separators
+        const sections = active.map((c) => {
+          const label = c.chunk_index === '0'
+            ? `[Summary]`
+            : `[Section ${c.chunk_index}]`;
+          return `${label}\n${c.text}`;
+        });
+
+        const docText = sections.join('\n\n---\n\n');
+        // Use the most recent created_at across all chunks (handles resynced docs correctly)
+        const latestDate = active.reduce((latest, c) => {
+          const d = c.created_at || '';
+          return d > latest ? d : latest;
+        }, '');
+        const header = `Document: ${safeName} (${active.length} section${active.length !== 1 ? 's' : ''}, last updated: ${formatDate(latestDate)})`;
+
+        return {
+          content: [
+            {
+              type: 'text',
+              text: `${header}\n\n${docText}`,
+            },
+          ],
+        };
+      } catch (err) {
+        return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
+      }
+    },
+  },
+
+  // ---------------------------------------------------------------------------
+  // todos — action items and short-term tasks
+  // ---------------------------------------------------------------------------
+  {
+    name: `${p}todos`,
+    definition: {
+      name: `${p}todos`,
+      description:
+        `Manage ${owner}'s action items and short-term tasks. Use this for quick reminders, next-session tasks, and to-do items that don't belong in the knowledge base. Actions: list (default), add, done, remove.`,
+      inputSchema: {
+        type: 'object',
+        properties: {
+          action: {
+            type: 'string',
+            enum: ['list', 'add', 'done', 'remove'],
+            description: 'Action to perform. Default: list',
+          },
+          text: {
+            type: 'string',
+            description: 'For add: the todo text.',
+          },
+          id: {
+            type: 'number',
+            description: 'For done/remove: the todo ID.',
+          },
+          due_date: {
+            type: 'string',
+            description: 'Optional due date in YYYY-MM-DD format.',
+          },
+          tags: {
+            type: 'string',
+            description: 'Optional comma-separated tags for filtering.',
+          },
+        },
+      },
+    },
+    async handler({ action = 'list', text, id, due_date, tags }) {
+      try {
+        switch (action) {
+          case 'add': {
+            if (!text || typeof text !== 'string' || text.trim().length === 0) {
+              return { content: [{ type: 'text', text: 'text is required for add action.' }], isError: true };
+            }
+            const todo = addTodo(text.trim(), due_date || null, tags || null);
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `Added todo #${todo.id}: ${todo.text}${due_date ? ` (due: ${due_date})` : ''}`,
+                },
+              ],
+            };
+          }
+
+          case 'done': {
+            const todoId = typeof id === 'number' ? Math.floor(id) : null;
+            if (!todoId || todoId <= 0) {
+              return { content: [{ type: 'text', text: 'id is required for done action.' }], isError: true };
+            }
+            const completed = completeTodo(todoId);
+            if (!completed) {
+              return {
+                content: [{ type: 'text', text: `Todo #${todoId} not found or already completed.` }],
+              };
+            }
+            return { content: [{ type: 'text', text: `Completed todo #${todoId}.` }] };
+          }
+
+          case 'remove': {
+            const todoId = typeof id === 'number' ? Math.floor(id) : null;
+            if (!todoId || todoId <= 0) {
+              return { content: [{ type: 'text', text: 'id is required for remove action.' }], isError: true };
+            }
+            const removed = removeTodo(todoId);
+            if (!removed) {
+              return { content: [{ type: 'text', text: `Todo #${todoId} not found.` }] };
+            }
+            return { content: [{ type: 'text', text: `Removed todo #${todoId}.` }] };
+          }
+
+          case 'list':
+          default: {
+            const openTodos = listTodos('open');
+            const stats = getTodoStats();
+
+            if (openTodos.length === 0) {
+              const summary = `No open todos. ${stats.done} completed total.`;
+              return { content: [{ type: 'text', text: summary }] };
+            }
+
+            const lines = openTodos.map(t => {
+              const due = t.due_date ? ` [due: ${t.due_date}]` : '';
+              const overdue = t.due_date && t.due_date < new Date().toISOString().slice(0, 10) ? ' OVERDUE' : '';
+              const tagStr = t.tags ? ` (${t.tags})` : '';
+              return `#${t.id}${overdue} ${t.text}${due}${tagStr}`;
+            });
+
+            const overdueNote = stats.overdue > 0 ? ` (${stats.overdue} overdue)` : '';
+            const header = `Open todos: ${stats.open}${overdueNote} | Done: ${stats.done}`;
+
+            return {
+              content: [
+                {
+                  type: 'text',
+                  text: `${header}\n\n${lines.join('\n')}`,
+                },
+              ],
+            };
+          }
+        }
       } catch (err) {
         return { content: [{ type: 'text', text: `Error: ${err.message}` }], isError: true };
       }
